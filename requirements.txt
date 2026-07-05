@@ -1,0 +1,6 @@
+pandas
+numpy
+scikit-learn
+chromadb
+requests
+python-dotenv
