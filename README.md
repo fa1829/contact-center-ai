@@ -92,6 +92,68 @@ Found 3 related historical incidents:
    change announcement...
 ```
 
+## Setting up your HuggingFace token (HF_TOKEN)
+
+`generate_with_llm()` needs an HF_TOKEN to call the router. There are two ways
+to provide it — pick whichever matches how you like to work.
+
+### Option A — `.env` file (recommended, no need to re-export every session)
+1. Create a file named `.env` in the project root (same folder as `rag_pipeline.py`):
+   ```bash
+   echo 'HF_TOKEN=your_actual_token_here' > .env
+   ```
+   Or copy an existing one from another project that already has it set up:
+   ```bash
+   cp ~/projects/fleet-qa-copilot/.env ~/projects/contact-center-ai/.env
+   ```
+2. Confirm the variable name inside matches exactly `HF_TOKEN` (not
+   `HUGGINGFACE_API_TOKEN` or similar) — check without printing the value:
+   ```bash
+   grep -o '^[A-Z_]*=' .env
+   ```
+3. `rag_pipeline.py` already calls `load_dotenv()` at the top, which reads
+   this file automatically — no manual export needed, and no code changes
+   required. Just run:
+   ```bash
+   python3 -c "
+   from rag_pipeline import retrieve, generate_with_llm
+   docs, metas, dist = retrieve('Why did call volume spike recently?', k=3)
+   print(generate_with_llm('Why did call volume spike recently?', docs))
+   "
+   ```
+4. **`.env` is already in `.gitignore`** — it will never be committed or
+   pushed to GitHub. Never remove that line.
+
+### Option B — export in the shell (no file, session-only)
+If you'd rather not keep a `.env` file at all:
+```bash
+export HF_TOKEN="your_actual_token_here"
+python3 -c "
+from rag_pipeline import retrieve, generate_with_llm
+docs, metas, dist = retrieve('Why did call volume spike recently?', k=3)
+print(generate_with_llm('Why did call volume spike recently?', docs))
+"
+```
+This only persists for the current terminal session — close the tab and
+you'll need to `export` it again next time. Useful for a quick one-off test
+without leaving a token file on disk at all.
+
+### Which one to use
+`.env` is more convenient for repeated testing (set once, forget it) and is
+the more common pattern in real projects — which is also why documenting it
+here, including the fact that it's gitignored, is worth mentioning if an
+interviewer asks how you handle secrets. `export` is fine for a single quick
+check or in a CI environment where the token is injected as a real
+environment variable rather than a file.
+
+### Confirmed working
+This was tested live end-to-end: retrieval returned 3 relevant incidents for
+*"Why did call volume spike recently?"*, and `generate_with_llm()` returned:
+> *"Call volume spiked recently due to a combination of factors including
+> seasonal demand, a product outage, and a policy change announcement."*
+Correctly grounded in the retrieved incidents, not hallucinated — confirming
+the full RAG loop (embed → retrieve → generate) works end-to-end.
+
 ## How to run (WSL/Ubuntu)
 ```bash
 cd ~/projects
@@ -102,16 +164,6 @@ source venv/bin/activate
 pip install -r requirements.txt
 python3 generate_data.py
 python3 rag_pipeline.py
-```
-
-### To test real LLM generation (requires internet + HF token)
-```bash
-export HF_TOKEN="your_huggingface_token_here"
-python3 -c "
-from rag_pipeline import retrieve, generate_with_llm
-docs, metas, dist = retrieve('Why did call volume spike recently?', k=3)
-print(generate_with_llm('Why did call volume spike recently?', docs))
-"
 ```
 
 ## Upgrading to real embeddings (the natural next step)
