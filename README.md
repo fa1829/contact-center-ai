@@ -1,197 +1,300 @@
 # contact-center-ai
 
-Phase 4 of the ML skills-build track (Manulife/RBC Borealis GenAI alignment).
-A **Retrieval-Augmented Generation (RAG)** pipeline that answers questions
-about contact-center operations by retrieving relevant historical incidents
-and generating a grounded answer — instead of an LLM guessing from general
-knowledge alone.
+A Retrieval-Augmented Generation (RAG) pipeline that answers natural-language
+questions about operational incidents by retrieving relevant historical records
+and generating a grounded response. Rather than letting a language model answer
+from its general training alone — where it may fabricate plausible-sounding
+details — the pipeline first retrieves real matching documents and then generates
+an answer constrained to that evidence.
 
-## Why RAG, and why this closes a specific job-posting gap
-Both Manulife and RBC Borealis postings mention GenAI as a differentiator.
-The naive approach — just calling an LLM with a raw question — produces
-answers that sound confident but aren't grounded in your actual data (this is
-the "hallucination" problem). **RAG fixes this** by first retrieving the most
-relevant real documents, then asking the LLM to answer *using only those
-documents as context*. This is the standard pattern behind every production
-"chat with your data" system.
+The project is self-contained: it generates a synthetic corpus of incident logs,
+indexes them in a local vector store, and answers questions against them, with an
+offline mode that requires no API key and an optional language-model mode for
+fully generated responses.
 
-## What problem is being solved
-Imagine an ops analyst asking: *"Why did call volume spike in December?"*
-Instead of manually searching through months of incident reports, this
-pipeline retrieves the handful of historical incidents most related to that
-question and synthesizes a direct answer — grounded in what actually happened,
-with the source incidents visible for verification.
+---
 
-## Architecture
+## Table of contents
+
+1. [Background: what RAG is and why it matters](#1-background)
+2. [Core concepts](#2-core-concepts)
+3. [Architecture](#3-architecture)
+4. [Repository contents](#4-repository-contents)
+5. [Procedure: running the pipeline](#5-procedure)
+6. [Configuring the language-model mode](#6-configuring-the-language-model-mode)
+7. [A limitation this project surfaces](#7-a-limitation-this-project-surfaces)
+8. [Design notes and limitations](#8-design-notes-and-limitations)
+9. [Requirements](#9-requirements)
+10. [Possible extensions](#10-possible-extensions)
+
+---
+
+## 1. Background
+
+### The problem RAG solves
+
+A large language model's knowledge is fixed at training time and generalized
+across a broad corpus. It has no access to a specific organization's private,
+current data — a set of incident logs, for example — and when asked about it
+directly, the model will often produce a fluent but fabricated answer. This is the
+well-known hallucination problem.
+
+**Retrieval-Augmented Generation (RAG)** addresses this by inserting a retrieval
+step before generation. Given a question, the system first finds the most relevant
+real documents, then asks the language model to answer *using only those documents
+as context*. The answer is therefore grounded in actual data rather than in the
+model's general priors. This is the standard architecture behind systems that
+answer questions over a private document corpus, and is widely adopted in
+regulated domains precisely because its answers can be traced back to source
+documents.
+
+### What this project is
+
+An end-to-end RAG pipeline over a synthetic corpus of contact-center incident
+summaries. It demonstrates the full retrieve-then-generate flow — embedding,
+vector storage, similarity search, and grounded answer generation — using
+lightweight, inspectable components so that each stage of the architecture is
+visible rather than hidden behind a framework.
+
+---
+
+## 2. Core concepts
+
+These concepts underpin the pipeline; reading them first makes the architecture in
+section 3 and the code straightforward to follow.
+
+### Vector-space semantics and embeddings
+
+An *embedding* converts text into a list of numbers (a vector) positioned in a
+high-dimensional space such that texts with similar meaning sit close together,
+measured by cosine similarity or distance. Two families of embedding exist:
+
+- **Statistical embeddings** such as **TF-IDF**, whose notion of similarity is
+  based on shared words weighted by rarity. They are simple, fully local, and
+  require no model download — but they are blind to meaning beyond exact tokens.
+- **Neural embeddings** (for example from sentence-transformer or hosted models),
+  trained so that *semantic* similarity, not just word overlap, determines
+  closeness. These capture that "outage" and "outages," or "spike" and "surge,"
+  are related — something TF-IDF cannot.
+
+This project uses TF-IDF so the whole pipeline runs offline and every step is
+transparent; the architecture (section 3) is designed so a neural embedding model
+can be substituted with no other changes.
+
+### TF-IDF, precisely
+
+TF-IDF combines **Term Frequency** (how often a word appears in a document) with
+**Inverse Document Frequency** (a penalty for words appearing in many documents,
+since common words carry little distinguishing information). The result gives the
+highest weight to words that are frequent in one document but rare across the
+whole collection — which is why this decades-old technique still performs
+reasonably for keyword-driven retrieval.
+
+### The retriever/generator split
+
+RAG deliberately separates *finding relevant information* from *phrasing an
+answer*. This is the classic software principle of separation of concerns applied
+to language systems: the embedding model, the vector store, and the generation
+model are independent components, each replaceable without touching the others.
+This is why upgrading from TF-IDF to a neural embedding model in this project
+requires no change to the vector-store or generation code.
+
+### Grounding and attribution
+
+Because a RAG answer is produced from specific retrieved documents, it can be
+traced back to them. This auditability — the ability to show *which* records
+informed an answer — is what distinguishes RAG from unconstrained generation, and
+is a primary reason regulated fields favor it.
+
+---
+
+## 3. Architecture
+
 ```
-question → embed → search vector store → top-k similar incidents → LLM (with those incidents as context) → grounded answer
+question
+   │
+   ▼
+[ embed question ]  ──TF-IDF──►  vector
+   │
+   ▼
+[ search vector store ]  ──ChromaDB──►  top-k most similar incident records
+   │
+   ▼
+[ generate answer ]  ──►  grounded response
+        │
+        ├── extractive mode  (offline, no API key)
+        └── language-model mode  (hosted LLM, requires token)
 ```
 
-| Stage | Tool used here | What it does |
+| Stage | Component | Role |
 |---|---|---|
-| **Knowledge base** | `generate_data.py` | 150 synthetic incident-log summaries (volume spikes, outages, escalation clusters, staffing gaps) |
-| **Embedding** | scikit-learn `TfidfVectorizer` | Converts each text document into a numeric vector based on word-importance weighting |
-| **Vector store** | ChromaDB (local, persistent) | Stores embeddings + original text + metadata; supports similarity search |
-| **Retrieval** | `collection.query()` | Given a new question's embedding, finds the k most similar stored vectors |
-| **Generation** | `extractive_summary()` (offline) or `generate_with_llm()` (HuggingFace router) | Turns retrieved incidents into a direct answer |
+| Corpus | `generate_data.py` | Produces synthetic incident-log summaries |
+| Embedding | `TfidfVectorizer` (scikit-learn) | Converts text to weighted-term vectors |
+| Vector store | ChromaDB (local, persistent) | Indexes vectors for fast similarity search |
+| Retrieval | ChromaDB query | Returns the k most similar records to a question |
+| Generation | extractive or hosted LLM | Produces the final grounded answer |
 
-## Term-by-term glossary
-- **RAG (Retrieval-Augmented Generation)**: answer generation that first
-  retrieves relevant real documents, then generates a response grounded in
-  them — instead of the model answering from what it memorized during training.
-- **Embedding**: converting text into a list of numbers (a vector) such that
-  similar meanings end up as similar vectors. Real embedding models (like
-  those on HuggingFace) capture semantic meaning; **TF-IDF**, used here,
-  captures word-overlap importance — simpler, fully local, but blind to
-  synonyms and word variants (see limitation below).
-- **Vector store**: a database built specifically for fast "find the most
-  similar vectors to this one" queries, rather than exact-match lookups like
-  a normal database.
-- **Cosine distance**: the similarity metric ChromaDB uses by default here —
-  lower distance means more similar; a distance near 1.0 means almost no
-  meaningful overlap between the query and the retrieved document.
+The two generation modes serve different needs. **Extractive mode** returns the
+retrieved records directly and runs fully offline with no credentials — useful for
+demonstrating and testing the retrieval half. **Language-model mode** sends the
+retrieved context and the question to a hosted model for a fully generated answer,
+and requires an API token (section 6).
 
-## A real limitation this project surfaced (worth knowing for interviews)
-Testing the query *"What caused recent system outages?"* returned weak
-matches — all at distance 1.0 (essentially no similarity) — because
-**TF-IDF has no stemming**: the query used "outages" (plural) while the
-documents used "outage" (singular), and TF-IDF treats these as completely
-unrelated tokens. A real embedding model (e.g. a HuggingFace sentence
-transformer) would recognize these as semantically identical and retrieve
-correctly. This is a genuine, honestly-reported limitation of the
-lightweight local approach — not a bug to hide, but the exact reason
-production RAG systems use neural embeddings instead of TF-IDF.
+---
 
-**The interview-ready answer**: *"I used TF-IDF for the embedding step so the
-whole pipeline runs fully offline with no model download — but testing it
-surfaced a real limitation: it missed a plural/singular match that a neural
-embedding model would catch. That's the actual tradeoff between a
-lightweight local demo and a production-grade embedding model, and I can
-point to exactly where and why it failed."* That's a stronger answer than
-claiming it worked perfectly.
+## 4. Repository contents
 
-## Two generation modes
-1. **`extractive_summary()`** — offline, no API key, fully testable anywhere.
-   Surfaces the retrieved incidents directly with a count. This is what ran
-   in the test output below.
-2. **`generate_with_llm()`** — calls HuggingFace's router
-   (`router.huggingface.co`, OpenAI-compatible chat completions), the same
-   pattern used in `fleet-qa-copilot`. Requires an `HF_TOKEN` environment
-   variable and internet access — run this in your WSL environment.
-
-## Sample output (from an actual run)
 ```
-QUERY: Why did call volume spike recently?
-Found 3 related historical incidents:
-1. Call volume spiked 64% above forecast on 2025-06-09 following seasonal
-   demand. Wait times increased to 8 minutes. Resolution: Customers were
-   proactively notified via SMS to reduce inbound volume.
-2. Call volume spiked 41% above forecast on 2025-05-07 following a product
-   outage...
-3. Call volume spiked 20% above forecast on 2025-06-18 following a policy
-   change announcement...
+contact-center-ai/
+├── generate_data.py      # Generates the synthetic incident-log corpus
+├── rag_pipeline.py       # Embedding, vector store, retrieval, generation
+├── incident_logs.csv     # Generated corpus (produced by generate_data.py)
+├── requirements.txt      # Python dependencies
+├── README.md
+└── .gitignore
 ```
 
-## Setting up your HuggingFace token (HF_TOKEN)
+A vector-store directory (`chroma_store/`) and a Python virtual environment
+(`venv/`) are created at runtime and are excluded from version control. A local
+`.env` file, if used for the language-model mode, is also excluded (section 6).
 
-`generate_with_llm()` needs an HF_TOKEN to call the router. There are two ways
-to provide it — pick whichever matches how you like to work.
+---
 
-### Option A — `.env` file (recommended, no need to re-export every session)
-1. Create a file named `.env` in the project root (same folder as `rag_pipeline.py`):
-   ```bash
-   echo 'HF_TOKEN=your_actual_token_here' > .env
-   ```
-   Or copy an existing one from another project that already has it set up:
-   ```bash
-   cp ~/projects/fleet-qa-copilot/.env ~/projects/contact-center-ai/.env
-   ```
-2. Confirm the variable name inside matches exactly `HF_TOKEN` (not
-   `HUGGINGFACE_API_TOKEN` or similar) — check without printing the value:
-   ```bash
-   grep -o '^[A-Z_]*=' .env
-   ```
-3. `rag_pipeline.py` already calls `load_dotenv()` at the top, which reads
-   this file automatically — no manual export needed, and no code changes
-   required. Just run:
-   ```bash
-   python3 -c "
-   from rag_pipeline import retrieve, generate_with_llm
-   docs, metas, dist = retrieve('Why did call volume spike recently?', k=3)
-   print(generate_with_llm('Why did call volume spike recently?', docs))
-   "
-   ```
-4. **`.env` is already in `.gitignore`** — it will never be committed or
-   pushed to GitHub. Never remove that line.
+## 5. Procedure
 
-### Option B — export in the shell (no file, session-only)
-If you'd rather not keep a `.env` file at all:
+The pipeline runs in a Python environment (including WSL on Windows).
+
+### Step 1 — Create an isolated environment and install dependencies
+
 ```bash
-export HF_TOKEN="your_actual_token_here"
-python3 -c "
-from rag_pipeline import retrieve, generate_with_llm
-docs, metas, dist = retrieve('Why did call volume spike recently?', k=3)
-print(generate_with_llm('Why did call volume spike recently?', docs))
-"
-```
-This only persists for the current terminal session — close the tab and
-you'll need to `export` it again next time. Useful for a quick one-off test
-without leaving a token file on disk at all.
-
-### Which one to use
-`.env` is more convenient for repeated testing (set once, forget it) and is
-the more common pattern in real projects — which is also why documenting it
-here, including the fact that it's gitignored, is worth mentioning if an
-interviewer asks how you handle secrets. `export` is fine for a single quick
-check or in a CI environment where the token is injected as a real
-environment variable rather than a file.
-
-### Confirmed working
-This was tested live end-to-end: retrieval returned 3 relevant incidents for
-*"Why did call volume spike recently?"*, and `generate_with_llm()` returned:
-> *"Call volume spiked recently due to a combination of factors including
-> seasonal demand, a product outage, and a policy change announcement."*
-Correctly grounded in the retrieved incidents, not hallucinated — confirming
-the full RAG loop (embed → retrieve → generate) works end-to-end.
-
-## How to run (WSL/Ubuntu)
-```bash
-cd ~/projects
-mkdir contact-center-ai && cd contact-center-ai
-# copy in the files from this delivery
+cd contact-center-ai
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+```
+
+A virtual environment keeps this project's dependencies isolated from other
+projects, so package versions cannot conflict.
+
+### Step 2 — Generate the synthetic corpus
+
+```bash
 python3 generate_data.py
+```
+
+This writes `incident_logs.csv` — a set of synthetic incident summaries (volume
+spikes, outages, escalation clusters, staffing gaps) with no real customer or
+operational data.
+
+### Step 3 — Run the pipeline
+
+```bash
 python3 rag_pipeline.py
 ```
 
-## Upgrading to real embeddings (the natural next step)
-Replace the TF-IDF block with a HuggingFace embedding call via
-`router.huggingface.co`, or a local `sentence-transformers` model if network
-access to the HF Hub is available. The rest of the pipeline (ChromaDB
-storage, retrieval, generation) needs no changes — this is exactly why RAG
-architectures separate "embedding model" from "vector store" from
-"generation model": each piece is swappable independently.
+This embeds the corpus with TF-IDF, indexes it in ChromaDB, and runs a set of
+example questions through the retrieve-then-answer flow. In its default extractive
+mode it requires no API key and runs fully offline, printing the retrieved
+incidents most relevant to each question along with their retrieval distances.
 
-## How this connects to your other projects
-- **fleet-qa-copilot**: this project's `generate_with_llm()` reuses the exact
-  `router.huggingface.co` calling pattern already validated there.
-- **timeseries-forecasting-lab**: the *question* this RAG system answers
-  ("why did volume spike?") is the natural companion to that project's
-  *forecast* of volume — one predicts the number, the other explains it.
-- **banking-intent-classifier**: together, these three projects cover the
-  three most common applied-ML task types financial-services/GenAI roles
-  ask about: time-series forecasting, tabular classification with
-  explainability, and retrieval-augmented generation.
+To use the language-model generation mode instead, configure a token first
+(section 6).
 
-## What this demonstrates (interview framing)
-- Understanding of RAG architecture end-to-end, not just "I called an LLM API"
-- Honest, specific awareness of the embedding-quality limitation and its fix
-- Clean separation of concerns (embedding / storage / retrieval / generation)
-  that maps directly onto how production RAG systems are actually built
-- Consistency with your existing `fleet-qa-copilot` HuggingFace integration pattern
+---
 
-## Repo convention
-Standalone repo: `github.com/fa1829/contact-center-ai` — consistent with
-`timeseries-forecasting-lab` and `banking-intent-classifier`.
+## 6. Configuring the language-model mode
+
+The language-model generation path sends retrieved context and the question to a
+hosted model (via an OpenAI-compatible chat-completions endpoint) and requires an
+API token supplied as the `HF_TOKEN` environment variable. Two ways to provide it:
+
+### Option A — `.env` file (persists across sessions)
+
+Create a file named `.env` in the project root containing the token:
+
+```bash
+echo 'HF_TOKEN=REPLACE_WITH_TOKEN' > .env
+```
+
+The pipeline loads this automatically at startup (via `python-dotenv`), so no
+manual export is needed. **The `.env` file is excluded by `.gitignore` and must
+never be committed** — it holds a live credential.
+
+### Option B — shell export (session-only)
+
+```bash
+export HF_TOKEN="REPLACE_WITH_TOKEN"
+python3 rag_pipeline.py
+```
+
+This persists only for the current terminal session, leaving no token file on
+disk — useful for a one-off run or in a CI environment where the token is injected
+as an environment variable.
+
+### A note on secret handling
+
+Whichever method is used, the token is a secret and should be treated as one: kept
+out of version control, out of command-line arguments that get logged, and rotated
+if ever exposed. Environment variables and ignored `.env` files are the standard
+mechanisms for exactly this reason.
+
+---
+
+## 7. A limitation this project surfaces
+
+Because the pipeline uses TF-IDF rather than a neural embedding model, retrieval is
+based on shared words rather than shared meaning. A query for "recent system
+outages" retrieves weakly against documents that use the singular "outage," because
+TF-IDF treats "outage" and "outages" as unrelated tokens — there is no stemming or
+semantic understanding. A neural embedding model would recognize these as the same
+concept and retrieve correctly.
+
+This is a genuine, reported limitation rather than a hidden flaw, and it makes
+concrete *why* production RAG systems use neural embeddings: the retrieval quality
+ceiling of a statistical embedding is lower. Because of the retriever/generator
+split (section 2), addressing it requires swapping only the embedding step — the
+vector store and generation logic are unaffected.
+
+---
+
+## 8. Design notes and limitations
+
+This project runs on synthetic data and uses a lightweight statistical embedding by
+default. It demonstrates the RAG architecture end to end — embedding, vector
+storage, retrieval, and grounded generation — with each stage inspectable rather
+than abstracted away. It is not a production retrieval system: it does not include
+neural embeddings, re-ranking, chunking strategies for long documents, or
+evaluation of answer faithfulness, each of which a production deployment would add.
+
+The clean separation of embedding, storage, and generation is the central design
+choice, and it mirrors how production RAG systems are structured so that each
+component can be scaled or replaced independently.
+
+---
+
+## 9. Requirements
+
+- Python 3.10+ (including WSL on Windows).
+- Dependencies in `requirements.txt`: pandas, numpy, scikit-learn, chromadb,
+  requests, python-dotenv.
+- For the language-model mode only: an `HF_TOKEN` and internet access to the
+  hosted model endpoint.
+
+---
+
+## 10. Possible extensions
+
+- Replace TF-IDF with a neural sentence-embedding model to enable semantic
+  retrieval; no change to the vector store or generation code is required.
+- Add re-ranking of retrieved candidates to improve top-k precision.
+- Add document chunking so longer records can be retrieved at passage granularity.
+- Add citation of the specific retrieved records that informed each generated
+  answer, making the grounding explicit.
+- Add an evaluation harness measuring answer faithfulness against the retrieved
+  context.
+
+---
+
+## License
+
+Released under the MIT License. See [LICENSE](LICENSE) for details.
