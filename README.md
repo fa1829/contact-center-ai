@@ -90,6 +90,24 @@ highest weight to words that are frequent in one document but rare across the
 whole collection — which is why this decades-old technique still performs
 reasonably for keyword-driven retrieval.
 
+### Vector stores and similarity search
+
+Once documents are embedded as vectors, answering a question means finding the
+document vectors closest to the question's vector. A **vector store** (also called
+a vector database) is a data store built specifically for this operation: it holds
+each document's vector alongside its original text and metadata, and answers
+"nearest-neighbour" queries — *return the k vectors most similar to this one* —
+efficiently. A conventional database is built for exact matches (find the row where
+id = 42); a vector store is built for approximate similarity (find the rows whose
+meaning is closest to this query), which is the operation retrieval depends on.
+
+This project uses **ChromaDB**, a local, persistent vector store. At index time
+each incident record's TF-IDF vector, its text, and an identifier are added to a
+ChromaDB collection. At query time the question is embedded with the same
+vectorizer and passed to ChromaDB, which returns the k closest records along with a
+distance score for each — a lower distance meaning a closer match. Those retrieved
+records become the grounding context for the generation step.
+
 ### The retriever/generator split
 
 RAG deliberately separates *finding relevant information* from *phrasing an
@@ -197,6 +215,25 @@ example questions through the retrieve-then-answer flow. In its default extracti
 mode it requires no API key and runs fully offline, printing the retrieved
 incidents most relevant to each question along with their retrieval distances.
 
+**Sample output (extractive mode).** For the question *"Why did call volume spike
+recently?"*, extractive mode returns the retrieved records directly, ordered by
+similarity:
+
+```
+QUERY: Why did call volume spike recently?
+Found 3 related historical incidents:
+1. Call volume spiked 64% above forecast following seasonal demand;
+   wait times rose to 8 minutes; customers notified via SMS to reduce inbound.
+2. Call volume spiked 41% above forecast following a product outage ...
+3. Call volume spiked 20% above forecast following a policy change announcement ...
+
+(retrieval distances: [0.71, 0.78, 0.82] — lower is a closer match)
+```
+
+Extractive mode performs no generation: it surfaces the evidence the retrieval step
+found. This is the fully offline, reproducible path, and it makes the retrieval
+quality directly visible through the distance scores.
+
 To use the language-model generation mode instead, configure a token first
 (section 6).
 
@@ -230,6 +267,34 @@ python3 rag_pipeline.py
 This persists only for the current terminal session, leaving no token file on
 disk — useful for a one-off run or in a CI environment where the token is injected
 as an environment variable.
+
+### Running a generated answer
+
+With a token configured, the language-model mode can be invoked for a single
+question:
+
+```bash
+python3 -c "
+from rag_pipeline import retrieve, generate_with_llm
+docs, metas, dist = retrieve('Why did call volume spike recently?', k=3)
+print(generate_with_llm('Why did call volume spike recently?', docs))
+"
+```
+
+**Sample output (language-model mode).** Instead of returning the raw records,
+this path sends them to the model as context and produces a synthesized answer
+grounded in them:
+
+```
+Call volume spiked recently due to a combination of factors including seasonal
+demand, a product outage, and a policy change announcement.
+```
+
+The distinction between the two modes is the essence of RAG. Extractive mode shows
+*what was retrieved*; language-model mode *phrases an answer* from it. Critically,
+the generated sentence draws only on the three retrieved incidents — seasonal
+demand, a product outage, and a policy change — rather than inventing causes, which
+is the grounding property that separates RAG from unconstrained generation.
 
 ### A note on secret handling
 
